@@ -10,91 +10,86 @@ import matplotlib.pyplot as plt
 from ultralytics import YOLO
 from pathlib import Path
 
-# Exemplo de criação da estrutura de pastas exigida pelo documento
-os.makedirs("PID_Project/imagens/originais", exist_ok=True)
-os.makedirs("PID_Project/imagens/processadas", exist_ok=True)
-os.makedirs("PID_Project/modelos", exist_ok=True)
+
 
 plt.rcParams['figure.figsize'] = [10, 8]
 IMAGENS_ORIGINAIS = Path('PID_Project/imagens/originais/')
 IMAGENS_PROCESSADAS = Path('PID_Project/imagens/processadas/')
 
+# Exemplo de criação da estrutura de pastas exigida pelo documento
+os.makedirs("PID_Project/imagens/originais", exist_ok=True)
+os.makedirs("PID_Project/imagens/processadas", exist_ok=True)
+os.makedirs("PID_Project/modelos", exist_ok=True)
 
 
-print("Estrutura de diretórios criada com sucesso!")
-
-def pre_processamento(caminho_imagem):
-    # Carregar imagem original (O OpenCV lê em BGR)
-    img = cv2.imread(str(caminho_imagem))
-    if img is None:
-        print(f"⚠️ Erro ao carregar a imagem: {caminho_imagem}")
-        return None, None, None
-        
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    # 1. Aplicar Blur para suavizar ruídos (Filtro Gaussiano)
-    img_blur = cv2.GaussianBlur(img_rgb, (5, 5), 0)
-
-    # 2. Conversão para HSV para isolar as manchas/doenças (Tons de marrom/amarelo)
-    img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # Definição de thresholds de cor (Tons amarelados/castanhos da doença)
-    limite_inferior = np.array([10, 50, 50])
-    limite_superior = np.array([30, 255, 255])
-
-    # Criar máscara isolando apenas a região da doença
-    mascara = cv2.inRange(img_hsv, limite_inferior, limite_superior)
-    resultado_threshold = cv2.bitwise_and(img_rgb, img_rgb, mask=mascara)
-
-    # Retorna as 3 variáveis que a função de lote espera receber
-    return img_rgb, img_blur, resultado_threshold
-
-def carregar_e_processar_pasta(pasta_origem, pasta_destino):
-    """
-    Varre a pasta de origem, aplica o pré-processamento e salva
-    fisicamente os resultados na Path de destino.
-    """
-    extensoes_validas = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
+def carregar_imagens(diretorio):
+    """Carrega todas as imagens da pasta origem e retorna uma lista."""
+    extensoes = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
+    lista_imagens = []
     
-    # Garante que a pasta de destino exista no Google Drive
-    pasta_destino.mkdir(parents=True, exist_ok=True)
+    for arquivo in diretorio.iterdir():
+        # Verifica se a extensão do arquivo é válida
+        if arquivo.suffix.lower() in extensoes:
+            img = cv2.imread(str(arquivo))
+            if img is not None:
+                # Salva o nome do arquivo e a imagem em uma lista
+                lista_imagens.append([arquivo.name, img])
+                print("Imagem carregada:", arquivo.name)
+                
+    return lista_imagens
 
-    # Listar e ordenar usando a biblioteca Path
-    arquivos = sorted(pasta_origem.iterdir())
-    imagens_carregadas = []
+def pre_processar_imagem(img):
+    """Aplica escala de cinza, desfoque e binarização em uma imagem."""
+    # 1. Escala de Cinza
+    cinza = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 2. Filtro de Suavização (Gaussian Blur)
+    suavizada = cv2.GaussianBlur(cinza, (5, 5), 0)
+    
+    # 3. Limiarização (Threshold de Otsu)
+    ret, binarizada = cv2.threshold(suavizada, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Retorna as três imagens geradas
+    return cinza, suavizada, binarizada
 
-    print(f"🔍 Verificando a pasta de origem: '{pasta_origem}'")
+def salvar_imagem(nome_original, imagem, sufixo_etapa, diretorio_destino):
+    """
+    Salva uma imagem qualquer adicionando um sufixo ao nome original.
+    Exemplo: "imagem1.jpg" com sufixo "canny" vira "canny_imagem1.jpg".
+    """
+    # Cria o nome do arquivo combinando o sufixo e o nome original
+    nome_arquivo_final = sufixo_etapa + "_" + nome_original
+    caminho_completo = diretorio_destino / nome_arquivo_final
+    
+    # Grava o arquivo no disco
+    cv2.imwrite(str(caminho_completo), imagem)
+    print("Arquivo salvo:", nome_arquivo_final)
 
-    for caminho_arquivo in arquivos:
-        # Verifica se é um arquivo de imagem válido
-        if caminho_arquivo.suffix.lower() in extensoes_validas:
-            nome_arquivo = caminho_arquivo.name
-            print(f"📸 Processando: {nome_arquivo}")
 
-            # Executa o pré-processamento passando o caminho completo (Path)
-            img_original, img_blur, img_thresh = pre_processamento(caminho_arquivo)
-            
-            if img_original is None:
-                continue
+# --- Execução do Fluxo com o Novo Método ---
 
-            # --- SALVAMENTO FISICO ---
-            # O OpenCV precisa receber a imagem de volta em BGR para salvar corretamente
-            img_thresh_bgr = cv2.cvtColor(img_thresh, cv2.COLOR_RGB2BGR)
-            caminho_salvamento = pasta_destino / f"proc_{nome_arquivo}"
-            cv2.imwrite(str(caminho_salvamento), img_thresh_bgr)
-            # -----------------------------------------
+# 1. Carrega as imagens
+imagens_originais = carregar_imagens(IMAGENS_ORIGINAIS)
 
-            # Armazena os resultados na memória (lista) para uso posterior no Colab
-            dados_imagem = {
-                "nome": nome_arquivo,
-                "original": img_original,
-                "blur": img_blur,
-                "threshold": img_thresh,
-                "caminho_salvo": caminho_salvamento
-            }
-            imagens_carregadas.append(dados_imagem)
+# Lista para guardar temporariamente os resultados na memória
+resultados_processados = []
 
-    print(f"\n Concluído! {len(imagens_carregadas)} imagens processadas e salvas em: '{pasta_destino}'")
-    return imagens_carregadas
+# 2. Processa
+for item in imagens_originais:
+    nome = item[0]
+    img = item[1]
+    
+    cinza, suavizada, binarizada = pre_processar_imagem(img)
+    resultados_processados.append([nome, cinza, suavizada, binarizada])
 
-lote_de_imagens = carregar_e_processar_pasta(IMAGENS_ORIGINAIS, IMAGENS_PROCESSADAS)
+# 3. Salva utilizando o método genérico para cada etapa individualmente
+for resultado in resultados_processados:
+    nome = resultado[0]
+    img_cinza = resultado[1]
+    img_suavizada = resultado[2]
+    img_binarizada = resultado[3]
+    
+    # Chamamos a mesma função mudando apenas o sufixo correspondente
+    salvar_imagem(nome, img_cinza, "cinza", IMAGENS_PROCESSADAS)
+    salvar_imagem(nome, img_suavizada, "suavizada", IMAGENS_PROCESSADAS)
+    salvar_imagem(nome, img_binarizada, "binarizada", IMAGENS_PROCESSADAS)
