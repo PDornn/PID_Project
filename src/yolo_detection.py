@@ -1,12 +1,14 @@
 """
-Detecção com YOLO - Capstone de Processamento Digital de Imagens
-Dataset: https://www.kaggle.com/datasets/mohitsingh1804/plantvillage
+Deteccao de doencas em plantas com YOLOv8 (DETECCAO DE OBJETOS).
+Dataset: Plant Disease Detection (Roboflow, formato YOLOv8 com bounding boxes).
 
-Usa YOLOv8 (Ultralytics) para:
-  1. Detecção geral de objetos com modelo pré-treinado COCO (yolov8n.pt)
-  2. Classificação de doenças em folhas com YOLOv8-cls fine-tuning
+Este modulo:
+  1. Carrega/treina o YOLOv8 para LOCALIZAR regioes de doenca (bounding boxes)
+  2. Roda inferencia em imagens novas
+  3. Fornece metricas (IoU / recall / precision) para comparar o YOLO
+     com o metodo classico HSV e com o ground-truth do dataset
 
-Referência: https://docs.ultralytics.com/
+Referencia: https://docs.ultralytics.com/
 """
 
 import cv2
@@ -21,7 +23,7 @@ except ImportError:
     print("[YOLO] Ultralytics nao instalado. Execute: pip install ultralytics")
 
 PROJETO_RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PASTA_MODELS = os.path.join(PROJETO_RAIZ, 'data', 'models')
+PASTA_MODELS = os.path.join(PROJETO_RAIZ, 'models')
 PASTA_RESULTS = os.path.join(PROJETO_RAIZ, 'results', 'yolo')
 
 
@@ -31,7 +33,8 @@ def _checar_yolo():
 
 
 def _caminho_modelo(nome):
-    """Retorna caminho local do modelo; se não existir, usa nome direto (download automático)."""
+    """Retorna o caminho local do modelo; se nao existir, usa o nome direto
+    (Ultralytics faz o download automatico do checkpoint pre-treinado)."""
     os.makedirs(PASTA_MODELS, exist_ok=True)
     local = os.path.join(PASTA_MODELS, nome)
     return local if os.path.exists(local) else nome
@@ -41,47 +44,100 @@ def _caminho_modelo(nome):
 
 def carregar_modelo_deteccao(nome='yolov8n.pt'):
     """
-    Carrega YOLOv8 para detecção de objetos (pré-treinado COCO).
+    Carrega YOLOv8 para deteccao de objetos.
 
-    Modelos disponíveis (do menor/mais rápido ao maior/mais preciso):
+    Modelos disponiveis (do menor/mais rapido ao maior/mais preciso):
       yolov8n.pt  yolov8s.pt  yolov8m.pt  yolov8l.pt  yolov8x.pt
     """
     _checar_yolo()
     return YOLO(_caminho_modelo(nome))
 
 
-def carregar_modelo_classificacao(nome='yolov8n-cls.pt'):
-    """
-    Carrega YOLOv8 no modo classificação (ImageNet pré-treinado).
-    Pode ser substituído por um modelo fine-tuned no PlantVillage.
-    """
-    _checar_yolo()
-    return YOLO(_caminho_modelo(nome))
-
-
 def carregar_modelo_custom(caminho_weights):
-    """Carrega qualquer modelo YOLO a partir de um arquivo .pt local."""
+    """Carrega qualquer modelo YOLO a partir de um arquivo .pt local (ex: best.pt)."""
     _checar_yolo()
     if not os.path.exists(caminho_weights):
         raise FileNotFoundError(f"Arquivo de pesos nao encontrado: {caminho_weights}")
     return YOLO(caminho_weights)
 
 
-# ─── Inferência ──────────────────────────────────────────────────────────────
+# ─── Treinamento (deteccao) ──────────────────────────────────────────────────
+
+def treinar_detector(
+    data_yaml,
+    epocas=30,
+    imgsz=640,
+    batch=16,
+    modelo_base='yolov8n.pt',
+    nome_experimento='plant_disease',
+    project=None,
+    device=None,
+):
+    """
+    Fine-tuning do YOLOv8 para DETECCAO de doencas no dataset Roboflow (formato YOLOv8).
+
+    O 'data_yaml' deve apontar para um arquivo data.yaml valido com as chaves:
+      path, train, val, test, nc, names
+
+    Parametros:
+        data_yaml         - caminho do arquivo data.yaml
+        epocas            - epocas de treinamento (30 e um bom ponto de partida)
+        imgsz             - tamanho das imagens de treino (640 padrao do YOLOv8)
+        batch             - tamanho do batch
+        modelo_base       - checkpoint inicial (yolov8n.pt = nano, rapido)
+        nome_experimento  - nome da pasta de saida
+        project           - diretorio raiz das runs (default: data/models/runs)
+
+    Retorna:
+        (modelo_treinado, resultado)  onde resultado.save_dir aponta para a run.
+    """
+    _checar_yolo()
+    if project is None:
+        project = os.path.join(PROJETO_RAIZ, 'models', 'runs')
+
+    modelo = YOLO(modelo_base)
+    resultado = modelo.train(
+        data=data_yaml,
+        task='detect',
+        epochs=epocas,
+        imgsz=imgsz,
+        batch=batch,
+        project=project,
+        name=nome_experimento,
+        exist_ok=True,
+        verbose=False,
+        device=device,
+    )
+    return modelo, resultado
+
+
+def avaliar_modelo(modelo, data_yaml, split='test'):
+    """Roda a validacao do Ultralytics e retorna as metricas (mAP50, mAP50-95, etc)."""
+    _checar_yolo()
+    metrics = modelo.val(data=data_yaml, split=split, verbose=False)
+    return {
+        'map50': float(getattr(metrics.box, 'map50', 0.0)),
+        'map50_95': float(getattr(metrics.box, 'map', 0.0)),
+        'precision': float(np.mean(metrics.box.p)) if len(metrics.box.p) else 0.0,
+        'recall': float(np.mean(metrics.box.r)) if len(metrics.box.r) else 0.0,
+    }
+
+
+# ─── Inferencia ──────────────────────────────────────────────────────────────
 
 def detectar_objetos(img_rgb, modelo=None, confianca=0.25, iou=0.45):
     """
-    Roda inferência de detecção de objetos (bounding boxes) em uma imagem.
+    Roda inferencia de deteccao (bounding boxes) em uma imagem RGB.
 
-    Parâmetros:
+    Parametros:
         img_rgb   - imagem RGB (numpy uint8)
-        modelo    - instância YOLO; None carrega yolov8n.pt
-        confianca - limiar mínimo de confiança
-        iou       - limiar de IoU para NMS
+        modelo    - instancia YOLO; None carrega yolov8n.pt
+        confianca - limiar minimo de confianca
+        iou       - limiar de IoU para o NMS
 
     Retorna:
-        img_anotada - imagem RGB com bboxes e rótulos desenhados
-        deteccoes   - lista de dicts: {'classe', 'confianca', 'bbox'}
+        img_anotada - imagem RGB com bboxes e rotulos desenhados
+        deteccoes   - lista de dicts: {'classe', 'confianca', 'bbox': (x1,y1,x2,y2)}
     """
     _checar_yolo()
     if modelo is None:
@@ -101,144 +157,75 @@ def detectar_objetos(img_rgb, modelo=None, confianca=0.25, iou=0.45):
 
             cv2.rectangle(img_anotada, (x1, y1), (x2, y2), (0, 200, 50), 2)
             rotulo = f'{cls_nome} {conf:.2f}'
-            (tw, th), _ = cv2.getTextSize(rotulo, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(img_anotada, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 200, 50), -1)
-            cv2.putText(img_anotada, rotulo, (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
+            (tw, th), _ = cv2.getTextSize(rotulo, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img_anotada, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, y1), (0, 200, 50), -1)
+            cv2.putText(img_anotada, rotulo, (x1 + 2, max(12, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
             deteccoes.append({'classe': cls_nome, 'confianca': conf, 'bbox': (x1, y1, x2, y2)})
 
     return img_anotada, deteccoes
 
 
-def classificar_folha(img_rgb, modelo_cls=None, top_k=5):
+# ─── Metricas de comparacao (IoU) ────────────────────────────────────────────
+
+def iou_xyxy(a, b):
+    """IoU entre duas caixas no formato (x1, y1, x2, y2)."""
+    xA = max(a[0], b[0]); yA = max(a[1], b[1])
+    xB = min(a[2], b[2]); yB = min(a[3], b[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    areaA = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    areaB = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    uniao = areaA + areaB - inter
+    return inter / uniao if uniao > 0 else 0.0
+
+
+def casar_caixas(gt, pred, iou_min=0.3):
     """
-    Classifica a imagem de folha usando YOLOv8-cls.
+    Compara caixas previstas (pred) com o ground-truth (gt), ambas em (x1,y1,x2,y2).
 
-    Com modelo ImageNet pré-treinado mostra as top-k classes gerais.
-    Com modelo fine-tuned no PlantVillage mostra doenças detectadas.
+    Faz um matching guloso: cada caixa GT busca a melhor caixa prevista ainda livre.
+    Um acerto (TP) ocorre quando IoU >= iou_min.
 
-    Parâmetros:
-        img_rgb   - imagem RGB da folha
-        modelo_cls - instância YOLO-cls; None carrega yolov8n-cls.pt
-        top_k     - número de melhores predições a retornar
-
-    Retorna:
-        img_anotada - imagem RGB com rótulo da classe mais provável
-        predicoes   - lista de dicts: {'classe', 'confianca'}
+    Retorna dict com: n_gt, n_pred, tp, recall, precision, iou_medio.
     """
-    _checar_yolo()
-    if modelo_cls is None:
-        modelo_cls = carregar_modelo_classificacao()
+    usados = set()
+    tp = 0
+    ious = []
+    for g in gt:
+        melhor = 0.0
+        melhor_j = -1
+        for j, p in enumerate(pred):
+            if j in usados:
+                continue
+            v = iou_xyxy(g, p)
+            if v > melhor:
+                melhor = v
+                melhor_j = j
+        if melhor >= iou_min and melhor_j >= 0:
+            usados.add(melhor_j)
+            tp += 1
+            ious.append(melhor)
 
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    resultados = modelo_cls(img_bgr, verbose=False)
-
-    predicoes = []
-    img_anotada = img_rgb.copy()
-
-    for r in resultados:
-        probs = r.probs
-        if probs is None:
-            continue
-        indices = probs.top5[:top_k]
-        for idx in indices:
-            predicoes.append({
-                'classe': modelo_cls.names[int(idx)],
-                'confianca': float(probs.data[int(idx)]),
-            })
-
-    if predicoes:
-        melhor = predicoes[0]
-        texto = f"{melhor['classe']}: {melhor['confianca']:.1%}"
-        h = img_anotada.shape[0]
-        cv2.rectangle(img_anotada, (0, h - 40), (img_anotada.shape[1], h), (0, 0, 0), -1)
-        cv2.putText(img_anotada, texto, (8, h - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-    return img_anotada, predicoes
+    n_gt = len(gt)
+    n_pred = len(pred)
+    return {
+        'n_gt': n_gt,
+        'n_pred': n_pred,
+        'tp': tp,
+        'recall': tp / n_gt if n_gt else 0.0,
+        'precision': tp / n_pred if n_pred else 0.0,
+        'iou_medio': float(np.mean(ious)) if ious else 0.0,
+    }
 
 
-def classificar_lote(amostras, modelo_cls=None, top_k=3):
+# ─── Utilitarios visuais ─────────────────────────────────────────────────────
+
+def comparar_metodos(img_rgb, resultado_classico, resultado_yolo,
+                     label_classico='Classico', label_yolo='YOLO'):
     """
-    Classifica uma lista de amostras (dicts com chave 'img' e 'classe').
-
-    Retorna lista de dicts com campos originais + 'predicao_yolo' e 'confianca_yolo'.
-    """
-    _checar_yolo()
-    if modelo_cls is None:
-        modelo_cls = carregar_modelo_classificacao()
-
-    resultados = []
-    for amostra in amostras:
-        img_anotada, preds = classificar_folha(amostra['img'], modelo_cls, top_k)
-        item = dict(amostra)
-        item['img_yolo'] = img_anotada
-        item['predicao_yolo'] = preds[0]['classe'] if preds else 'N/A'
-        item['confianca_yolo'] = preds[0]['confianca'] if preds else 0.0
-        item['top_k_preds'] = preds
-        resultados.append(item)
-
-    return resultados
-
-
-# ─── Treinamento ─────────────────────────────────────────────────────────────
-
-def treinar_classificador(
-    caminho_dataset,
-    epocas=10,
-    imgsz=224,
-    modelo_base='yolov8n-cls.pt',
-    nome_experimento='plantvillage_cls',
-):
-    """
-    Fine-tuning de YOLOv8-cls no dataset PlantVillage.
-
-    O dataset deve ter subpastas por classe:
-      data/PlantVillage/
-        ├── Tomato___Early_blight/
-        ├── Tomato___healthy/
-        └── ...
-
-    Parâmetros:
-        caminho_dataset    - raiz do dataset com subpastas por classe
-        epocas             - épocas de treinamento (10 é suficiente para demo)
-        imgsz              - tamanho das imagens (224 padrão)
-        modelo_base        - checkpoint inicial
-        nome_experimento   - nome da pasta de saída em results/yolo_train/
-
-    Retorna o modelo treinado.
-    """
-    _checar_yolo()
-    os.makedirs(PASTA_RESULTS, exist_ok=True)
-
-    modelo = YOLO(modelo_base)
-    modelo.train(
-        data=caminho_dataset,
-        epochs=epocas,
-        imgsz=imgsz,
-        task='classify',
-        project=os.path.join(PROJETO_RAIZ, 'results', 'yolo_train'),
-        name=nome_experimento,
-        exist_ok=True,
-    )
-    return modelo
-
-
-# ─── Utilitários ─────────────────────────────────────────────────────────────
-
-def comparar_metodos(img_rgb, resultado_classico, resultado_yolo, label_classico='Clássico', label_yolo='YOLO'):
-    """
-    Gera uma imagem lado a lado comparando detecção clássica com YOLO.
-
-    Parâmetros:
-        img_rgb          - imagem original RGB
-        resultado_classico - imagem RGB com anotações do método clássico
-        resultado_yolo   - imagem RGB com anotações do YOLO
-        label_classico   - rótulo do painel esquerdo
-        label_yolo       - rótulo do painel direito
-
-    Retorna imagem combinada (numpy RGB).
+    Gera uma imagem lado a lado: Original | metodo classico | YOLO.
+    Todas as imagens de entrada sao RGB.
     """
     h = max(img_rgb.shape[0], resultado_classico.shape[0], resultado_yolo.shape[0])
     alvo = (320, h)
@@ -266,9 +253,8 @@ def comparar_metodos(img_rgb, resultado_classico, resultado_yolo, label_classico
 
 
 def salvar_resultado_yolo(img_rgb, nome_arquivo):
-    """Salva imagem anotada pelo YOLO na pasta results/yolo/."""
+    """Salva uma imagem anotada na pasta results/yolo/."""
     os.makedirs(PASTA_RESULTS, exist_ok=True)
     caminho = os.path.join(PASTA_RESULTS, nome_arquivo)
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(caminho, img_bgr)
+    cv2.imwrite(caminho, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
     print(f'[YOLO] Salvo: {caminho}')
