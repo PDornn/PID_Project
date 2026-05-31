@@ -9,6 +9,34 @@ PROJETO_RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASTA_RESULTS = os.path.join(PROJETO_RAIZ, 'results')
 
 
+def grade(imagens, titulos, cols=3, figsize=(15, 5), nome=None, results_dir=None, dpi=100):
+    """Exibe imagens em grade e salva se nome e results_dir forem fornecidos."""
+    n = len(imagens)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=figsize, dpi=dpi, squeeze=False)
+    for i, ax in enumerate(axes.flatten()):
+        if i < n:
+            img = imagens[i]
+            ax.imshow(img, cmap='gray' if len(img.shape) == 2 else None)
+            ax.set_title(titulos[i], fontsize=10, pad=4)
+        ax.axis('off')
+    plt.tight_layout(pad=0.5)
+    if nome and results_dir:
+        os.makedirs(results_dir, exist_ok=True)
+        caminho = os.path.join(results_dir, nome)
+        fig.savefig(caminho, bbox_inches='tight', dpi=dpi)
+        print(f'  Salvo -> {caminho}')
+    plt.show()
+    plt.close(fig)
+
+
+def sep(titulo):
+    """Imprime separador de secao."""
+    print(f'\n{"=" * 55}')
+    print(f'  {titulo}')
+    print('=' * 55)
+
+
 def mostrar_imagem(img, titulo='Imagem', figsize=(8, 6)):
     """Exibe uma única imagem com matplotlib."""
     plt.figure(figsize=figsize)
