@@ -219,7 +219,7 @@ def plot_val_batch(run_dir, output_dir, dpi=120, mostrar=False):
 
 # ─── Pipeline completo ────────────────────────────────────────────────────────
 
-def gerar_todos(results_csv, run_dir, output_dir, dpi=120, mostrar=False):
+def gerar_graficos(results_csv, run_dir, output_dir, dpi=120, mostrar=False):
     """
     Gera todos os gráficos de avaliação, salva em output_dir e,
     se mostrar=True, exibe cada figura inline (uso no notebook).

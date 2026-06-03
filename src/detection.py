@@ -340,7 +340,7 @@ def segmentar_folha_verde(img_rgb):
     return folha_segmentada, mascara
 
 
-def detectar_lesoes_hsv(img_rgb, sensibilidade='media'):
+def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
     """
     Segmenta manchas de doença (tons marrom, amarelo, bege) usando HSV.
 
@@ -348,8 +348,11 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media'):
     com cores que diferem do verde saudável. Este método as isola via HSV.
 
     Parâmetros:
-        img_rgb      - imagem RGB da folha
+        img_rgb       - imagem RGB da folha
         sensibilidade - 'baixa', 'media' ou 'alta' (controla abertura da faixa HSV)
+        mascara_folha - máscara binária da folha (retorno de segmentar_folha_verde).
+                        Se fornecida, restringe a busca por lesões à área da folha,
+                        eliminando falsos positivos causados por sombra e fundo.
 
     Retorna:
         mascara_lesao  - máscara binária com as regiões de lesão (uint8)
@@ -384,6 +387,10 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media'):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     combinada = cv2.morphologyEx(combinada, cv2.MORPH_OPEN, kernel, iterations=1)
     combinada = cv2.morphologyEx(combinada, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # Restringe à área da folha — elimina falsos positivos de sombra e fundo
+    if mascara_folha is not None:
+        combinada = cv2.bitwise_and(combinada, mascara_folha)
 
     # Componentes conectados para contar e localizar lesões
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combinada)
