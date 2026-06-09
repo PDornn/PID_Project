@@ -315,10 +315,12 @@ def detectar_bordas_sobel(img, ksize=3):
 
 def segmentar_folha_verde(img_rgb):
     """
-    Isola a folha do fundo usando segmentação por cor no espaço HSV.
+    Isola a folha do fundo combinando segmentação HSV verde com Canny.
 
-    Aplica uma máscara para manter apenas os tons de verde típicos de folhas.
-    Útil como pré-etapa antes de detectar as lesões.
+    Estratégia: HSV verde identifica pixels de folha pela cor; Canny aplicado
+    sobre a máscara HSV binária (limpa) encontra bordas sempre fechadas sem
+    interferência do fundo; fill do contorno + AND com HSV elimina qualquer
+    fundo capturado pelo fill; morfologia fecha lesões escuras no interior.
 
     Retorna:
         folha_segmentada - imagem RGB com o fundo removido (preto)
@@ -326,21 +328,43 @@ def segmentar_folha_verde(img_rgb):
     """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
-    # Verde claro e verde escuro cobrem a maioria das folhas saudáveis
-    lower_verde = np.array([25, 40, 40])
-    upper_verde = np.array([90, 255, 255])
-    mascara = cv2.inRange(hsv, lower_verde, upper_verde)
+    # 1. Máscara HSV verde
+    verde = cv2.inRange(hsv, np.array([25, 40, 30]), np.array([90, 255, 255]))
 
-    # Morfologia para fechar buracos e remover ruído
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel, iterations=1)
+    # 2. Canny na máscara verde (bordas sempre fechadas)
+    blur_verde = cv2.GaussianBlur(verde, (7, 7), 0)
+    bordas = cv2.Canny(blur_verde, 30, 90)
+
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    bordas_d = cv2.dilate(bordas, k5, iterations=2)
+
+    # 3. Fill do maior contorno → limite rígido da borda
+    contornos, _ = cv2.findContours(bordas_d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    limite = np.zeros(verde.shape, dtype=np.uint8)
+    if contornos:
+        maior = max(contornos, key=cv2.contourArea)
+        cv2.fillPoly(limite, [maior], 255)
+
+    # 4. AND com HSV verde — remove fundo incluído pelo fill
+    mascara = cv2.bitwise_and(limite, verde)
+
+    # 5. Fecha buracos das lesões escuras dentro da folha
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k_close, iterations=3)
+    mascara = cv2.bitwise_and(mascara, limite)
+
+    # 6. Mantém só o maior componente (exclui pixels verdes espúrios do fundo)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mascara)
+    if n > 1:
+        maior_idx = 1 + int(np.argmax([stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]))
+        mascara = ((labels == maior_idx) * 255).astype(np.uint8)
 
     folha_segmentada = cv2.bitwise_and(img_rgb, img_rgb, mask=mascara)
     return folha_segmentada, mascara
 
 
-def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
+def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None,
+                        area_minima=50, max_aspecto=4.0):
     """
     Segmenta manchas de doença (tons marrom, amarelo, bege) usando HSV.
 
@@ -349,10 +373,11 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
 
     Parâmetros:
         img_rgb       - imagem RGB da folha
-        sensibilidade - 'baixa', 'media' ou 'alta' (controla abertura da faixa HSV)
-        mascara_folha - máscara binária da folha (retorno de segmentar_folha_verde).
-                        Se fornecida, restringe a busca por lesões à área da folha,
-                        eliminando falsos positivos causados por sombra e fundo.
+        sensibilidade - 'baixa', 'media', 'alta' ou 'grape_black_rot'
+        mascara_folha - máscara binária da folha (retorno de segmentar_folha_verde)
+        area_minima   - área mínima em pixels para considerar um componente
+        max_aspecto   - razão máxima max(w,h)/min(w,h); elimina formas alongadas
+                        como caules e pecíolos (default=4.0)
 
     Retorna:
         mascara_lesao  - máscara binária com as regiões de lesão (uint8)
@@ -362,7 +387,9 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
     """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
-    # Faixas HSV para lesões: marrom, amarelo-torrado, bege
+    # Faixas HSV para lesões
+    # grape_black_rot: calibrado empiricamente para H=20-45 (olive-marrom),
+    #   S=50-220, V=10-130 — valores amostrados nos pixels reais das lesões GT.
     faixas = {
         'baixa': [
             (np.array([10, 60, 40]),  np.array([25, 255, 200])),   # marrom escuro
@@ -377,6 +404,16 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
             (np.array([0,  20,  20]),  np.array([40, 255, 255])),  # marrom a amarelo amplo
             (np.array([0,  10,  30]),  np.array([15, 180, 180])),  # tons escuros
         ],
+        'grape_black_rot': [
+            # Quase-preto / escleródio — qualquer matiz, S baixo, V ≤ 45
+            (np.array([0,   0,  0]),  np.array([179, 100,  45])),
+            # Centro escuro/preto — tom marrom, V até 90
+            (np.array([0,  20,  0]),  np.array([ 20, 255,  90])),
+            # Corpo marrom escuro — H<20 exclui amarelo-verde
+            (np.array([0,  40, 30]),  np.array([ 20, 255, 160])),
+            # Borda marrom-laranja escura — V<110 impede capturar tecido verde-amarelo
+            (np.array([20, 80, 30]),  np.array([ 35, 255, 110])),
+        ],
     }
 
     combinada = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -385,27 +422,32 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None):
 
     # Morfologia para remover ruído e conectar manchas próximas
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    combinada = cv2.morphologyEx(combinada, cv2.MORPH_OPEN, kernel, iterations=1)
+    combinada = cv2.morphologyEx(combinada, cv2.MORPH_OPEN,  kernel, iterations=1)
     combinada = cv2.morphologyEx(combinada, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     # Restringe à área da folha — elimina falsos positivos de sombra e fundo
     if mascara_folha is not None:
         combinada = cv2.bitwise_and(combinada, mascara_folha)
 
-    # Componentes conectados para contar e localizar lesões
+    # Componentes conectados — filtra por área e razão de aspecto
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combinada)
-    area_minima = 50
     bboxes = []
     mascara_final = np.zeros_like(combinada)
 
     for i in range(1, n_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= area_minima:
-            mascara_final[labels == i] = 255
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            bboxes.append((x, y, w, h))
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < area_minima:
+            continue
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        # Elimina formas muito alongadas (caules, pecíolos, nervuras)
+        aspecto = max(w, h) / max(1, min(w, h))
+        if aspecto > max_aspecto:
+            continue
+        mascara_final[labels == i] = 255
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        bboxes.append((x, y, w, h))
 
     img_lesao = cv2.bitwise_and(img_rgb, img_rgb, mask=mascara_final)
     return mascara_final, img_lesao, len(bboxes), bboxes
