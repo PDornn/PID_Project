@@ -10,10 +10,19 @@ Técnicas vistas em aula:
 
 Funções adicionais para detecção de doenças em plantas (PlantVillage):
   - detectar_bordas_sobel         : gradiente de intensidade via Sobel
-  - segmentar_folha_verde         : isola a folha do fundo via HSV
+  - segmentar_folha_verde         : isola a folha do fundo (BORDA via CANNY)
   - detectar_lesoes_hsv           : segmenta manchas de doença (marrom/amarelo)
   - destacar_regiao_doenca        : aplica máscara colorida sobre lesões
   - compor_diagnostico_visual     : composição final blend/paste com ROI
+
+NOTA SOBRE O CANNY (correção principal):
+  O Canny agora é o MOTOR da segmentação da folha. O fundo texturizado é
+  suprimido por uma pré-máscara de cor (verde via canal 'a' do LAB ⋃ marrom
+  via HSV); o Canny detecta a borda real da folha dentro dessa região; essa
+  borda é fechada e preenchida para virar a máscara. A pré-máscara também
+  "grampeia" o resultado para o contorno colar nas serrilhas e não estourar
+  para o fundo. As lesões de margem entram na folha porque o marrom participa
+  da pré-máscara.
 """
 import cv2
 import numpy as np
@@ -24,35 +33,222 @@ CURSO_RAIZ = os.path.dirname(os.path.dirname(PROJETO_RAIZ))
 HAARCASCADES = os.path.join(CURSO_RAIZ, 'deteccao_de_imagens', 'haarcascades')
 
 
-# ─── Detecção de Bordas ──────────────────────────────────────────────────────
+# ─── Helpers compartilhados ──────────────────────────────────────────────────
 
-def detectar_bordas_canny(img, threshold1=None, threshold2=None):
+# Faixas HSV de marrom/necrótico calibradas nos pixels reais da amostra de uva
+# (OpenCV: H 0-179). Lesão típica medida: H≈13, S≈150, V≈52 (marrom escuro saturado).
+_FAIXAS_MARROM = [
+    (np.array([0, 40, 20]), np.array([25, 255, 190])),   # corpo marrom
+    (np.array([0, 25, 20]), np.array([20, 255, 120])),   # marrom escuro de margem
+]
+
+
+def _auto_canny(gray, sigma=0.33):
+    """Canny com limiares automáticos pela mediana (ignora pixels zerados/fundo)."""
+    amostra = gray[gray > 0]
+    med = np.median(amostra) if amostra.size else 0
+    t1 = int(max(0, (1.0 - sigma) * med))
+    t2 = int(min(255, (1.0 + sigma) * med))
+    return cv2.Canny(gray, t1, t2)
+
+
+def _mascara_marrom(hsv):
+    """Une as faixas HSV de marrom em uma máscara binária (verde NÃO entra)."""
+    m = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lo, hi in _FAIXAS_MARROM:
+        m = cv2.bitwise_or(m, cv2.inRange(hsv, lo, hi))
+    return m
+
+
+def _premask_cor(img_rgb):
     """
-    Detecção de bordas com o algoritmo Canny.
+    Pré-máscara de COR = folha verde (canal 'a' do LAB, Otsu) ⋃ manchas marrons (HSV).
 
-    Se os thresholds não forem informados, são calculados automaticamente
-    com base na mediana dos pixels — técnica ensinada em aula.
+    Serve para (a) suprimir o fundo texturizado antes do Canny e (b) garantir que
+    as lesões de margem entrem na folha.
+
+    Retorna (fill_cor, borda_cor, maior_contorno):
+      fill_cor  - máscara preenchida do maior contorno de cor
+      borda_cor - contorno externo desenhado (linha), usado para fechar o Canny
+      maior     - o maior contorno (ou None)
+    """
+    suave = cv2.bilateralFilter(img_rgb, 9, 75, 75)
+    lab = cv2.cvtColor(suave, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+
+    _, verde = cv2.threshold(lab[:, :, 1], 0, 255,
+                             cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    marrom = _mascara_marrom(hsv)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    uni = cv2.bitwise_or(verde, marrom)
+    uni = cv2.morphologyEx(uni, cv2.MORPH_CLOSE, k, iterations=4)
+    uni = cv2.morphologyEx(uni, cv2.MORPH_OPEN, k, iterations=2)
+
+    contornos, _ = cv2.findContours(uni, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    fill_cor = np.zeros(uni.shape, dtype=np.uint8)
+    borda_cor = np.zeros(uni.shape, dtype=np.uint8)
+    maior = None
+    if contornos:
+        maior = max(contornos, key=cv2.contourArea)
+        cv2.drawContours(fill_cor, [maior], -1, 255, cv2.FILLED)
+        cv2.drawContours(borda_cor, [maior], -1, 255, 2)
+    return fill_cor, borda_cor, maior
+
+
+def _maior_componente(mascara):
+    """Mantém apenas o maior componente conectado da máscara."""
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mascara)
+    if n <= 1:
+        return mascara
+    idx = 1 + int(np.argmax([stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]))
+    return ((labels == idx) * 255).astype(np.uint8)
+
+
+def _remover_peciolo(mascara, ks=25):
+    """
+    Remove o pecíolo (cabinho) SEM arredondar as serrilhas/dentes da folha.
+
+    Em vez de erodir/dilatar a máscara inteira (o que cortaria os dentes), isola
+    as PROTUBERÂNCIAS = máscara − abertura(máscara). Dentes e pecíolo viram
+    protuberâncias; o pecíolo é a protuberância longa/grande na BASE da folha.
+    Removemos só essa, preservando os dentes em todo o resto do contorno.
+    """
+    opened = cv2.morphologyEx(
+        mascara, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks)), 1)
+    protr = cv2.subtract(mascara, opened)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(protr)
+    out = mascara.copy()
+    Himg = mascara.shape[0]
+    for i in range(1, n):
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        A = stats[i, cv2.CC_STAT_AREA]
+        na_base = (y + h) > 0.82 * Himg
+        alongado_ou_grande = (max(w, h) / max(1, min(w, h)) > 1.6) or (A > 0.004 * mascara.size)
+        if na_base and alongado_ou_grande:
+            out[labels == i] = 0
+    return _maior_componente(out)
+
+
+def _mascara_folha_canny(img_rgb, ks_peciolo=25):
+    """
+    MÁSCARA DA FOLHA (APENAS a folha, borda JUSTA) com o CANNY detectando a borda.
+
+    Correções de aperto (resultado anterior estava "inchado" e pegava fundo):
+      - morfologia MÍNIMA (kernels 3×3), para não arredondar as serrilhas
+      - Canny detecta a borda real e o contorno é grampeado justo à cor
+      - remove o fundo/sombra acromático (cinza) que entrava perto da base
+      - remove o pecíolo preservando os dentes (ver _remover_peciolo)
 
     Etapas:
-      1. Converte para grayscale
-      2. Aplica blur para reduzir bordas falsas
-      3. Aplica Canny com thresholds baseados na mediana
+      1. Pré-máscara de cor (verde LAB ⋃ marrom HSV), morfologia 3×3 -> contorno justo
+      2. Canny no canal L dentro da ROI -> borda; fecha leve -> preenche
+      3. Grampeia justo à cor (dilatação 3×3)
+      4. Remove acromático (cinza) + pecíolo -> APENAS a folha
+
+    Retorna (mascara_uint8, maior_contorno).
+    """
+    suave = cv2.bilateralFilter(img_rgb, 7, 60, 60)
+    lab = cv2.cvtColor(suave, cv2.COLOR_RGB2LAB)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    S, V = hsv[:, :, 1], hsv[:, :, 2]
+
+    _, verde = cv2.threshold(lab[:, :, 1], 0, 255,
+                             cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    marrom = _mascara_marrom(hsv)
+
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    uni = cv2.morphologyEx(cv2.bitwise_or(verde, marrom), cv2.MORPH_OPEN, k3, 1)
+    uni = cv2.morphologyEx(uni, cv2.MORPH_CLOSE, k3, 1)
+    c, _ = cv2.findContours(uni, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not c:
+        return uni, None
+    maior_cor = max(c, key=cv2.contourArea)
+    tight = np.zeros(uni.shape, dtype=np.uint8)
+    cv2.drawContours(tight, [maior_cor], -1, 255, cv2.FILLED)
+
+    # 2. CANNY detecta a borda dentro de uma ROI estreita (morfologia mínima)
+    roi = cv2.dilate(tight, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)), 1)
+    L = cv2.bitwise_and(lab[:, :, 0], lab[:, :, 0], mask=roi)
+    edges = cv2.bitwise_and(_auto_canny(cv2.bilateralFilter(L, 7, 60, 60)), roi)
+    borda_cor = np.zeros(uni.shape, dtype=np.uint8)
+    cv2.drawContours(borda_cor, [maior_cor], -1, 255, 1)
+    fronteira = cv2.morphologyEx(cv2.bitwise_or(edges, borda_cor), cv2.MORPH_CLOSE, k3, 1)
+    c2, _ = cv2.findContours(fronteira, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    mascara = np.zeros(uni.shape, dtype=np.uint8)
+    if c2:
+        cv2.drawContours(mascara, [max(c2, key=cv2.contourArea)], -1, 255, cv2.FILLED)
+    mascara = cv2.bitwise_and(mascara, cv2.dilate(tight, k3, 1))  # grampeia justo
+
+    # 3. remove fundo/sombra acromático (cinza) que entrou perto da base
+    acrom = ((S < 35) & (V > 70)).astype(np.uint8) * 255
+    mascara = cv2.bitwise_and(mascara, cv2.bitwise_not(acrom))
+
+    # 4. remove o pecíolo (preserva dentes) + maior componente + CLOSE mínimo
+    mascara = _remover_peciolo(mascara, ks_peciolo)
+    mascara = cv2.morphologyEx(
+        mascara, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), 1)
+
+    cnts2, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    maior = max(cnts2, key=cv2.contourArea) if cnts2 else None
+    return mascara, maior
+    return mascara, maior
+
+
+# ─── Detecção de Bordas ──────────────────────────────────────────────────────
+
+def detectar_bordas_canny(img, threshold1=None, threshold2=None,
+                          mascara_folha=None, somente_borda_externa=True):
+    """
+    Detecção de bordas com Canny — versão robusta para folha sobre fundo.
+
+    O fundo texturizado é ELIMINADO antes do Canny pela máscara de cor; a borda
+    externa sai garantidamente fechada (vem do maior contorno).
+
+    Parâmetros:
+      threshold1/threshold2 : limiares manuais. Se None, automáticos (±33% da mediana).
+      mascara_folha         : máscara da folha pronta (opcional). Se None, calculada
+                              via _mascara_folha_canny (inclui lesões de margem).
+      somente_borda_externa : True -> só o contorno externo limpo.
+                              False -> contorno externo + nervuras/detalhes internos.
     """
     if len(img.shape) == 3:
+        if mascara_folha is None:
+            mascara_folha, maior = _mascara_folha_canny(img)
+        else:
+            cnts, _ = cv2.findContours(mascara_folha, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+            maior = max(cnts, key=cv2.contourArea) if cnts else None
+
+        borda_externa = np.zeros(mascara_folha.shape, dtype=np.uint8)
+        if maior is not None:
+            cv2.drawContours(borda_externa, [maior], -1, 255, 2)
+        if somente_borda_externa:
+            return borda_externa
+
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        gray = cv2.bitwise_and(gray, gray, mask=mascara_folha)
     else:
+        mascara_folha = None
+        borda_externa = None
         gray = img.copy()
 
-    # Blur antes do Canny para suavizar ruído (ensinado em aula)
-    blurred = cv2.blur(gray, ksize=(5, 5))
+    # Bilateral preserva melhor a borda real que o Gaussian + reduz textura
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
 
     if threshold1 is None or threshold2 is None:
-        # Thresholds automáticos baseados na mediana dos pixels
-        med = np.median(blurred)
-        threshold1 = int(max(0, 0.7 * med))
-        threshold2 = int(min(255, 1.3 * med))
+        amostra = blurred[blurred > 0] if mascara_folha is not None else blurred
+        med = np.median(amostra) if amostra.size else 0
+        threshold1 = int(max(0,   (1.0 - 0.33) * med))
+        threshold2 = int(min(255, (1.0 + 0.33) * med))
 
     edges = cv2.Canny(image=blurred, threshold1=threshold1, threshold2=threshold2)
+
+    if mascara_folha is not None:
+        edges = cv2.bitwise_and(edges, edges, mask=mascara_folha)
+        edges = cv2.bitwise_or(edges, borda_externa)  # garante contorno externo fechado
     return edges
 
 
@@ -315,104 +511,74 @@ def detectar_bordas_sobel(img, ksize=3):
 
 def segmentar_folha_verde(img_rgb):
     """
-    Isola a folha do fundo combinando segmentação HSV verde com Canny.
+    Isola a folha COMPLETA (tecido verde + manchas) do fundo, com o CANNY
+    detectando a borda.
 
-    Estratégia: HSV verde identifica pixels de folha pela cor; Canny aplicado
-    sobre a máscara HSV binária (limpa) encontra bordas sempre fechadas sem
-    interferência do fundo; fill do contorno + AND com HSV elimina qualquer
-    fundo capturado pelo fill; morfologia fecha lesões escuras no interior.
+    Pipeline (ver _mascara_folha_canny):
+      1. Pré-máscara de cor (verde LAB ⋃ marrom HSV) suprime o fundo
+      2. CANNY detecta a borda real da folha dentro dessa região
+      3. Borda fechada -> maior contorno -> preenchimento = máscara
+      4. Grampeada à extensão de cor (cola nas serrilhas) + CLOSE final
+
+    Por que unir o marrom: as lesões na margem não são verdes; sem elas na
+    pré-máscara, o contorno as cortaria fora da folha.
 
     Retorna:
-        folha_segmentada - imagem RGB com o fundo removido (preto)
-        mascara          - máscara binária da folha (uint8)
+        folha_segmentada - imagem RGB com fundo removido (preto)
+        mascara          - máscara binária da folha completa (uint8)
     """
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
-    # 1. Máscara HSV verde
-    verde = cv2.inRange(hsv, np.array([25, 40, 30]), np.array([90, 255, 255]))
-
-    # 2. Canny na máscara verde (bordas sempre fechadas)
-    blur_verde = cv2.GaussianBlur(verde, (7, 7), 0)
-    bordas = cv2.Canny(blur_verde, 30, 90)
-
-    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    bordas_d = cv2.dilate(bordas, k5, iterations=2)
-
-    # 3. Fill do maior contorno → limite rígido da borda
-    contornos, _ = cv2.findContours(bordas_d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    limite = np.zeros(verde.shape, dtype=np.uint8)
-    if contornos:
-        maior = max(contornos, key=cv2.contourArea)
-        cv2.fillPoly(limite, [maior], 255)
-
-    # 4. AND com HSV verde — remove fundo incluído pelo fill
-    mascara = cv2.bitwise_and(limite, verde)
-
-    # 5. Fecha buracos das lesões escuras dentro da folha
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, k_close, iterations=3)
-    mascara = cv2.bitwise_and(mascara, limite)
-
-    # 6. Mantém só o maior componente (exclui pixels verdes espúrios do fundo)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mascara)
-    if n > 1:
-        maior_idx = 1 + int(np.argmax([stats[i, cv2.CC_STAT_AREA] for i in range(1, n)]))
-        mascara = ((labels == maior_idx) * 255).astype(np.uint8)
-
+    mascara, _ = _mascara_folha_canny(img_rgb)
     folha_segmentada = cv2.bitwise_and(img_rgb, img_rgb, mask=mascara)
     return folha_segmentada, mascara
 
 
-def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None,
-                        area_minima=50, max_aspecto=4.0):
+def detectar_lesoes_hsv(img_rgb, sensibilidade='uva', mascara_folha=None,
+                        area_minima=45, max_aspecto=4.0, erosao_borda=13):
     """
     Segmenta manchas de doença (tons marrom, amarelo, bege) usando HSV.
 
-    Doenças como Early Blight, Late Blight e Bacterial Spot produzem lesões
-    com cores que diferem do verde saudável. Este método as isola via HSV.
-
     Parâmetros:
         img_rgb       - imagem RGB da folha
-        sensibilidade - 'baixa', 'media', 'alta' ou 'grape_black_rot'
-        mascara_folha - máscara binária da folha (retorno de segmentar_folha_verde)
-        area_minima   - área mínima em pixels para considerar um componente
+        sensibilidade - 'baixa', 'media', 'alta', 'grape_black_rot' ou 'uva'
+                        ('uva' = faixa marrom calibrada nesta amostra)
+        mascara_folha - máscara da folha (retorno de segmentar_folha_verde)
+        area_minima   - área mínima (px) de um componente para virar lesão
         max_aspecto   - razão máxima max(w,h)/min(w,h); elimina formas alongadas
-                        como caules e pecíolos (default=4.0)
+        erosao_borda  - erode a máscara da folha antes de procurar lesão, para
+                        descartar a borda amarelada que encosta no fundo
+                        (principal fonte de falso positivo). 0 = desliga.
 
     Retorna:
         mascara_lesao  - máscara binária com as regiões de lesão (uint8)
         img_lesao      - imagem RGB com apenas as regiões de lesão visíveis
-        n_lesoes       - número de componentes conectados de lesão detectados
+        n_lesoes       - número de lesões detectadas
         bboxes         - lista de (x, y, w, h) de cada lesão
     """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
-    # Faixas HSV para lesões
-    # grape_black_rot: calibrado empiricamente para H=20-45 (olive-marrom),
-    #   S=50-220, V=10-130 — valores amostrados nos pixels reais das lesões GT.
     faixas = {
         'baixa': [
-            (np.array([10, 60, 40]),  np.array([25, 255, 200])),   # marrom escuro
-            (np.array([20, 50, 150]), np.array([35, 255, 255])),   # amarelo-pálido
+            (np.array([10, 60, 40]),  np.array([25, 255, 200])),
+            (np.array([20, 50, 150]), np.array([35, 255, 255])),
         ],
         'media': [
-            (np.array([5,  40,  30]),  np.array([30, 255, 220])),  # marrom
-            (np.array([15, 30, 100]), np.array([40, 255, 255])),   # amarelo/bege
-            (np.array([0,  20,  60]),  np.array([12, 200, 200])),  # tons alaranjados
+            (np.array([5,  40,  30]), np.array([30, 255, 220])),
+            (np.array([15, 30, 100]), np.array([40, 255, 255])),
+            (np.array([0,  20,  60]), np.array([12, 200, 200])),
         ],
         'alta': [
-            (np.array([0,  20,  20]),  np.array([40, 255, 255])),  # marrom a amarelo amplo
-            (np.array([0,  10,  30]),  np.array([15, 180, 180])),  # tons escuros
+            (np.array([0,  20,  20]), np.array([40, 255, 255])),
+            (np.array([0,  10,  30]), np.array([15, 180, 180])),
         ],
         'grape_black_rot': [
-            # Quase-preto / escleródio — qualquer matiz, S baixo, V ≤ 45
             (np.array([0,   0,  0]),  np.array([179, 100,  45])),
-            # Centro escuro/preto — tom marrom, V até 90
             (np.array([0,  20,  0]),  np.array([ 20, 255,  90])),
-            # Corpo marrom escuro — H<20 exclui amarelo-verde
             (np.array([0,  40, 30]),  np.array([ 20, 255, 160])),
-            # Borda marrom-laranja escura — V<110 impede capturar tecido verde-amarelo
             (np.array([20, 80, 30]),  np.array([ 35, 255, 110])),
+        ],
+        # Calibrado nos pixels reais desta amostra (marrom escuro saturado)
+        'uva': [
+            (np.array([0, 45, 25]),   np.array([22, 255, 175])),
         ],
     }
 
@@ -421,13 +587,19 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None,
         combinada = cv2.bitwise_or(combinada, cv2.inRange(hsv, lower, upper))
 
     # Morfologia para remover ruído e conectar manchas próximas
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    combinada = cv2.morphologyEx(combinada, cv2.MORPH_OPEN,  kernel, iterations=1)
-    combinada = cv2.morphologyEx(combinada, cv2.MORPH_CLOSE, kernel, iterations=2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    combinada = cv2.morphologyEx(combinada, cv2.MORPH_OPEN, kernel, iterations=1)
+    combinada = cv2.morphologyEx(
+        combinada, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=2)
 
-    # Restringe à área da folha — elimina falsos positivos de sombra e fundo
+    # Restringe ao INTERIOR da folha — erode a borda amarela que encosta no fundo
     if mascara_folha is not None:
-        combinada = cv2.bitwise_and(combinada, mascara_folha)
+        interior = mascara_folha
+        if erosao_borda > 0:
+            ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erosao_borda, erosao_borda))
+            interior = cv2.erode(mascara_folha, ke, iterations=1)
+        combinada = cv2.bitwise_and(combinada, interior)
 
     # Componentes conectados — filtra por área e razão de aspecto
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(combinada)
@@ -440,14 +612,10 @@ def detectar_lesoes_hsv(img_rgb, sensibilidade='media', mascara_folha=None,
             continue
         w = stats[i, cv2.CC_STAT_WIDTH]
         h = stats[i, cv2.CC_STAT_HEIGHT]
-        # Elimina formas muito alongadas (caules, pecíolos, nervuras)
-        aspecto = max(w, h) / max(1, min(w, h))
-        if aspecto > max_aspecto:
+        if max(w, h) / max(1, min(w, h)) > max_aspecto:
             continue
         mascara_final[labels == i] = 255
-        x = stats[i, cv2.CC_STAT_LEFT]
-        y = stats[i, cv2.CC_STAT_TOP]
-        bboxes.append((x, y, w, h))
+        bboxes.append((stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], w, h))
 
     img_lesao = cv2.bitwise_and(img_rgb, img_rgb, mask=mascara_final)
     return mascara_final, img_lesao, len(bboxes), bboxes
